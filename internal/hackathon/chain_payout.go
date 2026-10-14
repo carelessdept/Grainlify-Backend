@@ -3,12 +3,14 @@ package hackathon
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"sort"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/jagadeesh/grainlify/backend/internal/db"
+	"github.com/jagadeesh/grainlify/backend/internal/settlement"
 )
 
 // On-chain spec §2.2: payout arithmetic is per chain.
@@ -162,11 +164,8 @@ func SettleMaintainerPoolPerChain(
 
 	out := map[string][]MaintainerPayout{}
 	for _, chainID := range chains {
-		var maintainerPool float64
-		if err := pool.QueryRow(ctx, `
-SELECT (maintainer_pool / (10 ^ asset_decimals))::float8
-FROM hackathon_chain_pools WHERE hackathon_id = $1 AND chain_id = $2
-`, hackathonID, chainID).Scan(&maintainerPool); err != nil {
+		poolMinor, err := chainMaintainerPoolMinorFor(ctx, pool, hackathonID, chainID)
+		if err != nil {
 			return nil, fmt.Errorf("hackathon.SettleMaintainerPoolPerChain: %s pool: %w", chainID, err)
 		}
 
@@ -211,9 +210,43 @@ ORDER BY p.id
 			}
 			scores = append(scores, s)
 		}
-		out[chainID] = AllocateMaintainerPool(scores, maintainerPool, cfg, timeNow())
+		payouts, err := AllocateMaintainerPoolMinor(scores, poolMinor, cfg, timeNow())
+		if err != nil {
+			return nil, fmt.Errorf("hackathon.SettleMaintainerPoolPerChain: %s allocate: %w", chainID, err)
+		}
+		out[chainID] = payouts
 	}
 	return out, nil
+}
+
+// chainMaintainerPoolMinorFor reads a chain's maintainer_pool as text and
+// converts it to exact settlement.AssetDecimals minor units.
+func chainMaintainerPoolMinorFor(ctx context.Context, pool db.DBPool, hackathonID uuid.UUID, chainID string) (*big.Int, error) {
+	var raw string
+	var decimals int
+	if err := pool.QueryRow(ctx, `
+SELECT COALESCE(maintainer_pool, 0)::text, asset_decimals
+FROM hackathon_chain_pools WHERE hackathon_id = $1 AND chain_id = $2
+`, hackathonID, chainID).Scan(&raw, &decimals); err != nil {
+		return nil, err
+	}
+	if raw == "" {
+		return new(big.Int), nil
+	}
+	r, ok := new(big.Rat).SetString(raw)
+	if !ok {
+		return nil, fmt.Errorf("maintainer_pool %q is not a number", raw)
+	}
+	if decimals < 0 {
+		return nil, fmt.Errorf("asset_decimals %d is negative", decimals)
+	}
+	chainScale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)
+	settleScale := new(big.Int).Exp(big.NewInt(10), big.NewInt(settlement.AssetDecimals), nil)
+	minor := new(big.Rat).Mul(r, new(big.Rat).SetFrac(settleScale, chainScale))
+	if !minor.IsInt() {
+		return nil, fmt.Errorf("maintainer_pool %q at %d decimals is finer than one minor unit", raw, decimals)
+	}
+	return new(big.Int).Set(minor.Num()), nil
 }
 
 // timeNow is a seam so a settle time can be pinned in a test without

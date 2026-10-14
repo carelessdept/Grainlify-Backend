@@ -3,6 +3,7 @@ package hackathon
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"strings"
 	"testing"
 	"time"
@@ -186,6 +187,53 @@ func TestAllocateMaintainerPool_HoldsBackTheConfiguredShare(t *testing.T) {
 	wantDue := settled.AddDate(0, 0, 90)
 	if p.HoldbackDueAt.Sub(wantDue) > time.Minute || wantDue.Sub(p.HoldbackDueAt) > time.Minute {
 		t.Errorf("holdback due %v, want ~%v (90 days)", p.HoldbackDueAt, wantDue)
+	}
+}
+
+// Three equal-score repos dividing 1000 USDC cannot be represented exactly in
+// binary float or independent cent rounding (333.33 x 3 = 999.99). Apportioning
+// in minor units via settlement.Apportion conserves every minor unit of the
+// pool and breaks remainder ties deterministically by lowest project id.
+func TestAllocateMaintainerPool_ConservesPoolExactlyAcrossTiesAndUnevenShares(t *testing.T) {
+	idLow := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	idMid := uuid.MustParse("00000000-0000-0000-0000-000000000002")
+	idHigh := uuid.MustParse("00000000-0000-0000-0000-000000000003")
+
+	scores := []MaintainerScore{
+		{ProjectID: idHigh, OrgLogin: "high", Score: 1},
+		{ProjectID: idLow, OrgLogin: "low", Score: 1},
+		{ProjectID: idMid, OrgLogin: "mid", Score: 1},
+	}
+	poolMinor := big.NewInt(1_000_000_000) // 1000 USDC in minor units
+	payouts, err := AllocateMaintainerPoolMinor(scores, poolMinor, map[string]string{}, time.Now())
+	if err != nil {
+		t.Fatalf("AllocateMaintainerPoolMinor: %v", err)
+	}
+
+	totalMinor := new(big.Int)
+	byProject := map[uuid.UUID]MaintainerPayout{}
+	for _, p := range payouts {
+		totalMinor.Add(totalMinor, p.GrossMinor)
+		byProject[p.ProjectID] = p
+
+		splitSum := new(big.Int).Add(p.ImmediateMinor, p.HoldbackMinor)
+		if splitSum.Cmp(p.GrossMinor) != 0 {
+			t.Errorf("%s: immediate (%s) + holdback (%s) != gross (%s)",
+				p.OrgLogin, p.ImmediateMinor, p.HoldbackMinor, p.GrossMinor)
+		}
+	}
+	if totalMinor.Cmp(poolMinor) != 0 {
+		t.Fatalf("allocated %s minor units, want exact pool %s", totalMinor, poolMinor)
+	}
+	// Lowest project ID receives the single leftover minor unit (333_333_334 vs 333_333_333).
+	if got := byProject[idLow].GrossMinor; got.Cmp(big.NewInt(333_333_334)) != 0 {
+		t.Errorf("lowest project id got %s minor units, want 333333334", got)
+	}
+	if got := byProject[idMid].GrossMinor; got.Cmp(big.NewInt(333_333_333)) != 0 {
+		t.Errorf("middle project id got %s minor units, want 333333333", got)
+	}
+	if got := byProject[idHigh].GrossMinor; got.Cmp(big.NewInt(333_333_333)) != 0 {
+		t.Errorf("highest project id got %s minor units, want 333333333", got)
 	}
 }
 

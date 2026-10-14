@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/big"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/jagadeesh/grainlify/backend/internal/db"
+	"github.com/jagadeesh/grainlify/backend/internal/settlement"
 )
 
 // AI-specs.md §7. Four criteria decide a maintainer's share; the fifth -
@@ -288,21 +291,82 @@ type MaintainerPayout struct {
 	OrgLogin        string    `json:"org_login"`
 	Score           float64   `json:"score"`
 	GrossAmount     float64   `json:"gross_amount"`
+	GrossMinor      *big.Int  `json:"gross_minor,omitempty"`
 	HoldbackPct     int       `json:"holdback_pct"`
 	HoldbackAmount  float64   `json:"holdback_amount"`
+	HoldbackMinor   *big.Int  `json:"holdback_minor,omitempty"`
 	ImmediateAmount float64   `json:"immediate_amount"`
+	ImmediateMinor  *big.Int  `json:"immediate_minor,omitempty"`
 	HoldbackDueAt   time.Time `json:"holdback_due_at"`
 }
 
-// AllocateMaintainerPool divides maintainerPool across scored repos in
-// proportion to score, then splits each share into an immediate part and a
-// holdback.
+// scoreRat parses a repo's score into an exact rational at NUMERIC(10,6)
+// precision - the same 6-decimal representation hackathon_maintainer_payouts.score
+// stores in Postgres - so the weight handed to settlement.Apportion and the
+// score persisted on the row are the same number.
+func scoreRat(score float64) (*big.Rat, string) {
+	if score <= 0 || math.IsNaN(score) || math.IsInf(score, 0) {
+		return new(big.Rat), "0"
+	}
+	s := strconv.FormatFloat(score, 'f', 6, 64)
+	r, ok := new(big.Rat).SetString(s)
+	if !ok || r.Sign() <= 0 {
+		s = strconv.FormatFloat(score, 'f', -1, 64)
+		r, ok = new(big.Rat).SetString(s)
+		if !ok || r.Sign() <= 0 {
+			return new(big.Rat), "0"
+		}
+	}
+	return r, s
+}
+
+func minorToFloat(v *big.Int) float64 {
+	if v == nil || v.Sign() == 0 {
+		return 0
+	}
+	f, _ := new(big.Rat).SetFrac(v, big.NewInt(1_000_000)).Float64()
+	return math.Round(f*1e6) / 1e6
+}
+
+func minorToDecimal(v *big.Int) string {
+	if v == nil {
+		return "0"
+	}
+	return settlement.RatToDecimalString(new(big.Rat).SetFrac(v, big.NewInt(1_000_000)), settlement.AssetDecimals)
+}
+
+func floatPoolToMinor(maintainerPool float64) (*big.Int, error) {
+	if maintainerPool <= 0 || math.IsNaN(maintainerPool) || math.IsInf(maintainerPool, 0) {
+		return new(big.Int), nil
+	}
+	s := strconv.FormatFloat(maintainerPool, 'f', settlement.AssetDecimals, 64)
+	r, ok := new(big.Rat).SetString(s)
+	if !ok {
+		return nil, fmt.Errorf("hackathon.AllocateMaintainerPool: pool %q is not a number", s)
+	}
+	minor := new(big.Rat).Mul(r, new(big.Rat).SetInt64(1_000_000))
+	if !minor.IsInt() {
+		return nil, fmt.Errorf("hackathon.AllocateMaintainerPool: pool %q is finer than one minor unit", s)
+	}
+	return new(big.Int).Set(minor.Num()), nil
+}
+
+// AllocateMaintainerPoolMinor divides poolMinor (in settlement.AssetDecimals
+// minor units) across scored repos in proportion to score using
+// settlement.Apportion, asserts that the allocated minor units sum to the pool,
+// and splits each repo's share into an immediate part and a holdback.
 //
-// maintainerPool is the *only* money that enters here. It is read from
-// hackathons.maintainer_prize_pool by the caller and never from
-// contributor_prize_pool - §7's opening requirement, and the reason the two
-// are separate columns rather than one pot with a label.
-func AllocateMaintainerPool(scores []MaintainerScore, maintainerPool float64, cfg map[string]string, settledAt time.Time) []MaintainerPayout {
+// Uses the same exact shape as the contributor settlement path: weights are
+// parsed from decimal text into big.Rat, largest-remainder apportionment via
+// settlement.Apportion converts rationals to integer minor units once with
+// deterministic tie-breaking by project id, and the sum-to-pool invariant is
+// checked against settlement.ErrAllocationMismatch.
+func AllocateMaintainerPoolMinor(
+	scores []MaintainerScore,
+	poolMinor *big.Int,
+	cfg map[string]string,
+	settledAt time.Time,
+) ([]MaintainerPayout, error) {
 	holdbackPct := atoiOr(cfg["maintainer_holdback_pct"], 30)
 	if holdbackPct < 0 {
 		holdbackPct = 0
@@ -316,25 +380,94 @@ func AllocateMaintainerPool(scores []MaintainerScore, maintainerPool float64, cf
 	}
 	due := settledAt.AddDate(0, 0, holdbackDays)
 
-	var totalScore float64
-	for _, s := range scores {
-		if s.Score > 0 {
-			totalScore += s.Score
+	if poolMinor == nil {
+		poolMinor = new(big.Int)
+	}
+
+	lines := make([]settlement.Line, len(scores))
+	total := new(big.Rat)
+	one := big.NewRat(1, 1)
+	for i, s := range scores {
+		w, _ := scoreRat(s.Score)
+		lines[i] = settlement.Line{
+			UserID:          s.ProjectID,
+			RawWeight:       new(big.Rat).Set(w),
+			Multiplier:      new(big.Rat).Set(one),
+			EffectiveWeight: new(big.Rat).Set(w),
+			AmountMinor:     new(big.Int),
+		}
+		if w.Sign() > 0 {
+			total.Add(total, w)
 		}
 	}
 
+	if poolMinor.Sign() > 0 && total.Sign() > 0 {
+		if err := settlement.Apportion(lines, poolMinor, total); err != nil {
+			return nil, fmt.Errorf("hackathon.AllocateMaintainerPoolMinor: %w", err)
+		}
+		res := &settlement.Result{
+			Pool:           "maintainer",
+			PoolMinor:      new(big.Int).Set(poolMinor),
+			AssetDecimals:  settlement.AssetDecimals,
+			TotalEffective: total,
+			Lines:          lines,
+		}
+		if got := res.TotalAllocatedMinor(); got.Cmp(poolMinor) != 0 {
+			return nil, fmt.Errorf("%w: allocated %s of %s minor units",
+				settlement.ErrAllocationMismatch, got, poolMinor)
+		}
+	}
+
+	pctBig := big.NewInt(int64(holdbackPct))
+	hundred := big.NewInt(100)
+	halfHundred := big.NewInt(50)
+
 	out := make([]MaintainerPayout, 0, len(scores))
-	for _, s := range scores {
-		p := MaintainerPayout{
-			ProjectID: s.ProjectID, OrgLogin: s.OrgLogin, Score: s.Score,
-			HoldbackPct: holdbackPct, HoldbackDueAt: due,
+	for i, s := range scores {
+		grossMinor := new(big.Int)
+		if lines[i].AmountMinor != nil {
+			grossMinor.Set(lines[i].AmountMinor)
 		}
-		if totalScore > 0 && s.Score > 0 && maintainerPool > 0 {
-			p.GrossAmount = round2(maintainerPool * (s.Score / totalScore))
-			p.HoldbackAmount = round2(p.GrossAmount * float64(holdbackPct) / 100.0)
-			p.ImmediateAmount = round2(p.GrossAmount - p.HoldbackAmount)
+		holdbackMinor := new(big.Int).Mul(grossMinor, pctBig)
+		if holdbackMinor.Sign() > 0 {
+			holdbackMinor.Add(holdbackMinor, halfHundred)
 		}
-		out = append(out, p)
+		holdbackMinor.Quo(holdbackMinor, hundred)
+		immediateMinor := new(big.Int).Sub(grossMinor, holdbackMinor)
+
+		out = append(out, MaintainerPayout{
+			ProjectID:       s.ProjectID,
+			OrgLogin:        s.OrgLogin,
+			Score:           s.Score,
+			GrossMinor:      grossMinor,
+			GrossAmount:     minorToFloat(grossMinor),
+			HoldbackPct:     holdbackPct,
+			HoldbackMinor:   holdbackMinor,
+			HoldbackAmount:  minorToFloat(holdbackMinor),
+			ImmediateMinor:  immediateMinor,
+			ImmediateAmount: minorToFloat(immediateMinor),
+			HoldbackDueAt:   due,
+		})
+	}
+	return out, nil
+}
+
+// AllocateMaintainerPool divides maintainerPool across scored repos in
+// proportion to score, then splits each share into an immediate part and a
+// holdback.
+//
+// maintainerPool is the *only* money that enters here. It is read from
+// hackathons.maintainer_prize_pool by the caller and never from
+// contributor_prize_pool - §7's opening requirement, and the reason the two
+// are separate columns rather than one pot with a label.
+func AllocateMaintainerPool(scores []MaintainerScore, maintainerPool float64, cfg map[string]string, settledAt time.Time) []MaintainerPayout {
+	poolMinor, err := floatPoolToMinor(maintainerPool)
+	if err != nil {
+		return nil
+	}
+	out, err := AllocateMaintainerPoolMinor(scores, poolMinor, cfg, settledAt)
+	if err != nil {
+		return nil
 	}
 	return out
 }
@@ -438,7 +571,9 @@ type ReviewMedianFn func(projectID uuid.UUID, repoFullName string) *float64
 // second allocation, so a retry after a partial failure converges instead of
 // paying twice.
 //
-// The money comes from hackathons.maintainer_prize_pool and nowhere else.
+// The money comes from hackathons.maintainer_prize_pool and nowhere else, read
+// as text and parsed into exact minor units so no binary floating-point step
+// enters the pool division.
 func SettleMaintainerPool(
 	ctx context.Context,
 	pool db.DBPool,
@@ -450,10 +585,8 @@ func SettleMaintainerPool(
 		return nil, fmt.Errorf("hackathon.SettleMaintainerPool: config: %w", err)
 	}
 
-	var maintainerPool float64
-	if err := pool.QueryRow(ctx, `
-SELECT COALESCE(maintainer_prize_pool, 0) FROM hackathons WHERE id = $1
-`, hackathonID).Scan(&maintainerPool); err != nil {
+	poolMinor, err := poolMinorFor(ctx, pool, hackathonID, "maintainer")
+	if err != nil {
 		return nil, fmt.Errorf("hackathon.SettleMaintainerPool: pool: %w", err)
 	}
 
@@ -501,7 +634,10 @@ ORDER BY p.id
 		owners[p.id] = p.owner
 	}
 
-	payouts := AllocateMaintainerPool(scores, maintainerPool, cfg, time.Now())
+	payouts, err := AllocateMaintainerPoolMinor(scores, poolMinor, cfg, time.Now())
+	if err != nil {
+		return nil, fmt.Errorf("hackathon.SettleMaintainerPool: allocate: %w", err)
+	}
 	byProject := map[uuid.UUID]MaintainerScore{}
 	for _, s := range scores {
 		byProject[s.ProjectID] = s
@@ -514,11 +650,12 @@ ORDER BY p.id
 			return nil, fmt.Errorf("hackathon.SettleMaintainerPool: marshal criteria: %w", err)
 		}
 		owner := owners[p.ProjectID]
+		_, scoreDec := scoreRat(s.Score)
 		if _, err := pool.Exec(ctx, `
 INSERT INTO hackathon_maintainer_payouts
   (hackathon_id, project_id, org_login, maintainer_user_id, score, criteria,
    gross_amount, holdback_pct, holdback_amount, immediate_amount, holdback_due_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+VALUES ($1,$2,$3,$4,$5::numeric,$6,$7::numeric,$8,$9::numeric,$10::numeric,$11)
 ON CONFLICT (hackathon_id, project_id) DO UPDATE SET
   org_login = EXCLUDED.org_login,
   maintainer_user_id = EXCLUDED.maintainer_user_id,
@@ -530,8 +667,8 @@ ON CONFLICT (hackathon_id, project_id) DO UPDATE SET
   immediate_amount = EXCLUDED.immediate_amount,
   holdback_due_at = EXCLUDED.holdback_due_at,
   updated_at = now()
-`, hackathonID, p.ProjectID, p.OrgLogin, owner, s.Score, criteriaJSON,
-			p.GrossAmount, p.HoldbackPct, p.HoldbackAmount, p.ImmediateAmount, p.HoldbackDueAt); err != nil {
+`, hackathonID, p.ProjectID, p.OrgLogin, owner, scoreDec, criteriaJSON,
+			minorToDecimal(p.GrossMinor), p.HoldbackPct, minorToDecimal(p.HoldbackMinor), minorToDecimal(p.ImmediateMinor), p.HoldbackDueAt); err != nil {
 			return nil, fmt.Errorf("hackathon.SettleMaintainerPool: persist: %w", err)
 		}
 	}
