@@ -2,7 +2,9 @@ package handlers_test
 
 import (
 	"context"
+	"io/fs"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	"github.com/jagadeesh/grainlify/backend/internal/auth"
 	"github.com/jagadeesh/grainlify/backend/internal/db"
 	"github.com/jagadeesh/grainlify/backend/internal/handlers"
+	"github.com/jagadeesh/grainlify/backend/migrations"
 )
 
 const breakGlassSecret = "break-glass-test-secret"
@@ -118,6 +121,75 @@ func TestBreakGlass_DirectDatabaseRoleChange(t *testing.T) {
 	}
 	if got := breakGlassCall(t, app, adminToken); got != fiber.StatusOK {
 		t.Errorf("after re-authentication: status = %d, want 200", got)
+	}
+}
+
+// TestBreakGlass_DirectRoleUpdateLeavesAuditRow verifies #503: a direct UPDATE
+// on users.role outside SetUserRole still writes an admin_role_audit row via
+// trg_users_audit_role_change with source = 'direct' and a NULL actor_user_id.
+func TestBreakGlass_DirectRoleUpdateLeavesAuditRow(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	userID := breakGlassUser(t, d, "contributor")
+
+	if _, err := d.Pool.Exec(ctx, `UPDATE users SET role = 'admin', updated_at = now() WHERE id = $1`, userID); err != nil {
+		t.Fatalf("direct UPDATE to admin: %v", err)
+	}
+
+	var oldRole, newRole, source string
+	var actorID *uuid.UUID
+	var note *string
+	if err := d.Pool.QueryRow(ctx, `
+SELECT old_role, new_role, source, actor_user_id, note
+FROM admin_role_audit
+WHERE subject_user_id = $1
+ORDER BY created_at DESC LIMIT 1
+`, userID).Scan(&oldRole, &newRole, &source, &actorID, &note); err != nil {
+		t.Fatalf("no audit row written for direct UPDATE: %v", err)
+	}
+	if oldRole != "contributor" || newRole != "admin" {
+		t.Errorf("audit transition = %s -> %s, want contributor -> admin", oldRole, newRole)
+	}
+	if source != "direct" {
+		t.Errorf("source = %q, want \"direct\"", source)
+	}
+	if actorID != nil {
+		t.Errorf("actor_user_id = %v, want nil for direct database UPDATE", actorID)
+	}
+	if note != nil {
+		t.Errorf("note = %v, want nil for direct database UPDATE", note)
+	}
+
+	// A no-op UPDATE that does not change users.role must not write a spurious row.
+	if _, err := d.Pool.Exec(ctx, `UPDATE users SET role = 'admin', updated_at = now() WHERE id = $1`, userID); err != nil {
+		t.Fatalf("no-op UPDATE: %v", err)
+	}
+	var count int
+	if err := d.Pool.QueryRow(ctx, `SELECT count(*)::int FROM admin_role_audit WHERE subject_user_id = $1`, userID).Scan(&count); err != nil {
+		t.Fatalf("count audit rows: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("audit row count after no-op UPDATE = %d, want 1", count)
+	}
+}
+
+func TestBreakGlass_RoleAuditTriggerMigrationIsEmbedded(t *testing.T) {
+	upSQL, err := fs.ReadFile(migrations.FS, "20261014120000_users_role_audit_trigger.up.sql")
+	if err != nil {
+		t.Fatalf("read up migration: %v", err)
+	}
+	s := string(upSQL)
+	for _, want := range []string{
+		"CHECK (source IN ('admin_action', 'bootstrap', 'direct'))",
+		"CREATE OR REPLACE FUNCTION users_audit_role_change()",
+		"CREATE TRIGGER trg_users_audit_role_change",
+		"AFTER UPDATE OF role ON users",
+		"WHEN (OLD.role IS DISTINCT FROM NEW.role)",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("migration missing %q", want)
+		}
 	}
 }
 

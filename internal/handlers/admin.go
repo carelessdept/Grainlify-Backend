@@ -97,12 +97,25 @@ func (h *AdminHandler) SetUserRole() fiber.Handler {
 		// change. "Alice promoted Bob from contributor to admin" is the useful
 		// fact; "Alice changed Bob's role" is not, and a demotion matters as
 		// much as a promotion.
+		//
+		// The AFTER UPDATE OF role trigger on users (trg_users_audit_role_change)
+		// is the single writer to admin_role_audit. Setting the transaction-local
+		// session variables inside the same statement passes actor and reason to
+		// the trigger without a second write, while any direct UPDATE outside
+		// SetUserRole defaults to source = 'direct' with a NULL actor (#503).
+		reason := strings.TrimSpace(req.Reason)
 		var oldRole string
 		err = h.db.Pool.QueryRow(c.Context(), `
+WITH audit_ctx AS (
+  SELECT set_config('grainlify.role_audit_source', 'admin_action', true),
+         set_config('grainlify.role_audit_actor_user_id', $3::text, true),
+         set_config('grainlify.role_audit_note', $4, true)
+)
 UPDATE users SET role = $2, updated_at = now()
-WHERE id = $1
+FROM audit_ctx
+WHERE users.id = $1
 RETURNING (SELECT role FROM users WHERE id = $1)
-`, userID, role).Scan(&oldRole)
+`, userID, role, actorID.String(), reason).Scan(&oldRole)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "user_not_found"})
 		}
@@ -114,21 +127,11 @@ RETURNING (SELECT role FROM users WHERE id = $1)
 			slog.Warn("admin role change",
 				"actor_user_id", actorID, "subject_user_id", userID,
 				"old_role", oldRole, "new_role", role)
-			h.recordRoleAudit(c, userID, oldRole, role, "admin_action", actorID, strings.TrimSpace(req.Reason))
 		}
 		return c.Status(fiber.StatusOK).JSON(fiber.Map{"ok": true, "old_role": oldRole, "new_role": role})
 	}
 }
 
-// recordRoleAudit writes one row to admin_role_audit.
-//
-// Best-effort and never fails the caller: the role change itself is already
-// committed, and refusing the response afterwards would leave the caller
-// believing it had not happened. A missing audit row is logged loudly so it
-// is visible rather than silent.
-//
-// oldRole is empty for a refused bootstrap, where no change occurred - the row
-// exists to record the attempt, not a transition.
 // Admin bootstrap was removed.
 //
 // It granted the first admin on a fresh install to whoever presented the
@@ -148,17 +151,5 @@ RETURNING (SELECT role FROM users WHERE id = $1)
 // policy, not an oversight.
 //
 // Every further admin is granted by an existing admin through SetUserRole,
-// which is attributed and audited.
-
-func (h *AdminHandler) recordRoleAudit(c *fiber.Ctx, subjectID uuid.UUID, oldRole, newRole, source string, actorID uuid.UUID, note string) {
-	if h.db == nil || h.db.Pool == nil {
-		return
-	}
-	if _, err := h.db.Pool.Exec(c.Context(), `
-INSERT INTO admin_role_audit (subject_user_id, old_role, new_role, source, actor_user_id, note)
-VALUES ($1, NULLIF($2, ''), $3, $4, $5, NULLIF($6, ''))
-`, subjectID, oldRole, newRole, source, actorID, note); err != nil {
-		slog.Error("admin role audit write failed",
-			"subject_user_id", subjectID, "source", source, "error", err)
-	}
-}
+// which is attributed and audited, and any direct UPDATE on users.role is
+// recorded by trg_users_audit_role_change with source = 'direct'.
