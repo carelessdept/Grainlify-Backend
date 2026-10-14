@@ -3,41 +3,20 @@ package auth
 import (
 	"context"
 	"errors"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/jagadeesh/grainlify/backend/internal/migrate"
+	"github.com/jagadeesh/grainlify/backend/internal/dbtest"
 )
 
-// authTestDB returns a live *pgxpool.Pool connected to TEST_DB_URL, migrated
-// to the current schema. This mirrors internal/handlers/testdb_test.go's
-// testDB helper, but lives here in package auth (white-box tests in this
-// package cannot import internal/handlers -- that would be a layering
-// violation and a needless import-cycle risk). *pgxpool.Pool satisfies
-// db.DBPool structurally, so it can be passed directly to CreateNonce /
-// ConsumeNonceAndUpsertUser.
+// authTestDB returns a live *pgxpool.Pool connected to this package's isolated
+// test database (gl_test_auth), migrated to the current schema via dbtest.DB.
 func authTestDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	dsn := os.Getenv("TEST_DB_URL")
-	if dsn == "" {
-		t.Skip("TEST_DB_URL not set; skipping test that needs a live database")
-	}
-
-	pool, err := pgxpool.New(context.Background(), dsn)
-	if err != nil {
-		t.Fatalf("pgxpool.New: %v", err)
-	}
-	t.Cleanup(pool.Close)
-
-	if err := migrate.Up(context.Background(), pool); err != nil {
-		t.Fatalf("migrate.Up: %v", err)
-	}
-
-	return pool
+	return dbtest.DB(t).Pool.(*pgxpool.Pool)
 }
 
 // repoTestUniqueAddress returns an arbitrary-but-unique wallet address

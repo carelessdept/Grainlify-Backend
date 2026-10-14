@@ -2,39 +2,19 @@ package handlers
 
 import (
 	"context"
-	"os"
 	"testing"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jagadeesh/grainlify/backend/internal/db"
-	"github.com/jagadeesh/grainlify/backend/internal/migrate"
+	"github.com/jagadeesh/grainlify/backend/internal/dbtest"
 )
 
-// referralsTestDB is a package-local copy of handlers_test's testDB helper:
-// an internal (package handlers) test file cannot call a helper defined in
-// the external handlers_test package, even though both live in this
-// directory and share a test binary. Same skip-if-unset behavior so
-// `go test ./...` stays green with no Postgres running.
+// referralsTestDB delegates to dbtest.DB so white-box tests in package handlers
+// run against the package-scoped gl_test_handlers database.
 func referralsTestDB(t *testing.T) *db.DB {
 	t.Helper()
-	dsn := os.Getenv("TEST_DB_URL")
-	if dsn == "" {
-		t.Skip("TEST_DB_URL not set; skipping test that needs a live database")
-	}
-
-	pool, err := pgxpool.New(context.Background(), dsn)
-	if err != nil {
-		t.Fatalf("pgxpool.New: %v", err)
-	}
-	t.Cleanup(pool.Close)
-
-	if err := migrate.Up(context.Background(), pool); err != nil {
-		t.Fatalf("migrate.Up: %v", err)
-	}
-
-	return &db.DB{Pool: pool}
+	return dbtest.DB(t)
 }
 
 // referralsCreateUser seeds a user row identified only by a UUID-suffixed

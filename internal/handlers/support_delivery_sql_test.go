@@ -2,11 +2,10 @@ package handlers
 
 import (
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jagadeesh/grainlify/backend/internal/dbtest"
 )
 
 // The SQL predicate and the Go function must return the same answer.
@@ -18,15 +17,7 @@ import (
 // this runs both against every combination of column states and compares them
 // rather than trusting the copies to stay in step.
 func TestSupportDelivered_SQLAndGoAgree(t *testing.T) {
-	dsn := os.Getenv("TEST_DB_URL")
-	if dsn == "" {
-		t.Skip("TEST_DB_URL not set")
-	}
-	pool, err := pgxpool.New(t.Context(), dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer pool.Close()
+	pool := dbtest.DB(t).Pool
 
 	now := time.Now()
 	stamps := []*time.Time{nil, &now}
